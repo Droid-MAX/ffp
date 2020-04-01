@@ -24,7 +24,7 @@ permitting programming of Cortex-M devices.
     3v3 --|1  2|-- FLASH DI / FPGA DO
     GND --|3  4|-- CLK
     GND --|5  6|-- CS
-        x-|7  8|-- FPGA nRST
+   NULL --|7  8|-- FPGA nRST
     GND --|9 10|-- FLASH DO / FPGA DI
           ------
 
