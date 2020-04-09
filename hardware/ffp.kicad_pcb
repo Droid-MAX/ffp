@@ -405,10 +405,10 @@
     )
   )
 
-  (module agg:0603 (layer F.Cu) (tedit 57654490) (tstamp 5CC78825)
+  (module agg:0603 (layer F.Cu) (tedit 57654490) (tstamp 5E8F009A)
     (at 141 123.5 270)
     (path /5CC8FE22)
-    (fp_text reference R1 (at 2.55004 -0.00302) (layer F.Fab)
+    (fp_text reference R1 (at 2.61862 -0.00302) (layer F.Fab)
       (effects (font (size 1 1) (thickness 0.15)))
     )
     (fp_text value 10k (at 2.225 0) (layer F.Fab) hide
@@ -469,10 +469,10 @@
       (net 2 3v3))
   )
 
-  (module agg:SOT-23-5 (layer F.Cu) (tedit 57656747) (tstamp 5CC787A0)
+  (module agg:SOT-23-5 (layer F.Cu) (tedit 57656747) (tstamp 5E8F011F)
     (at 144 123.5)
     (path /5CD0E2B8)
-    (fp_text reference IC3 (at -0.00232 2.56782) (layer F.Fab)
+    (fp_text reference IC3 (at -0.00994 2.61862) (layer F.Fab)
       (effects (font (size 1 1) (thickness 0.15)))
     )
     (fp_text value MIC2004-0_5YM5 (at 0 2.45) (layer F.Fab) hide
@@ -762,7 +762,7 @@
   (module agg:0603 (layer F.Cu) (tedit 57654490) (tstamp 5CC786CA)
     (at 152 124.5)
     (path /5CD25E8F)
-    (fp_text reference C7 (at 0.02662 1.56274 180) (layer F.Fab)
+    (fp_text reference C7 (at 0.01646 1.61354 180) (layer F.Fab)
       (effects (font (size 1 1) (thickness 0.15)))
     )
     (fp_text value 100n (at 2.225 0 90) (layer F.Fab) hide
