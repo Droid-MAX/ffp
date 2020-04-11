@@ -25,6 +25,24 @@ pub struct Pins<'a> {
     pub fpga_si: Pin<'a>,
     pub tpwr_det: Pin<'a>,
     pub tpwr_en: Pin<'a>,
+
+    pub flash_si_input_mode: MemoisedMode,
+    pub flash_si_alternate_mode: MemoisedMode,
+    pub sck_output_mode: MemoisedMode,
+    pub sck_alternate_mode: MemoisedMode,
+}
+
+/// Stores a pre-computed mask and value for quickly changing pin mode
+#[derive(Copy, Clone)]
+pub struct MemoisedMode {
+    mask: u32,
+    value: u32,
+}
+
+impl MemoisedMode {
+    pub fn new() -> Self {
+        MemoisedMode { mask: 0, value: 0 }
+    }
 }
 
 impl<'a> GPIO {
@@ -68,20 +86,49 @@ impl<'a> GPIO {
         self
     }
 
+    pub const fn memoise_mode(n: u8, mode: u32) -> MemoisedMode {
+        let n = n & 0xF;
+        let offset = n * 2;
+        let mask = 0b11 << offset;
+        let value = (mode << offset) & mask;
+        MemoisedMode { mask: !mask, value }
+    }
+
+    pub fn apply_memoised_mode(&'a self, mode: &MemoisedMode) -> &Self {
+        modify_reg!(gpio, self.p, MODER, |r| (r & mode.mask) | mode.value);
+        self
+    }
+
     pub fn set_mode_input(&'a self, n: u8) -> &Self {
         self.set_mode(n, gpio::MODER::MODER0::RW::Input)
+    }
+
+    pub const fn memoise_mode_input(n: u8) -> MemoisedMode {
+        Self::memoise_mode(n, gpio::MODER::MODER0::RW::Input)
     }
 
     pub fn set_mode_output(&'a self, n: u8) -> &Self {
         self.set_mode(n, gpio::MODER::MODER0::RW::Output)
     }
 
+    pub const fn memoise_mode_output(n: u8) -> MemoisedMode {
+        Self::memoise_mode(n, gpio::MODER::MODER0::RW::Output)
+    }
+
     pub fn set_mode_alternate(&'a self, n: u8) -> &Self {
         self.set_mode(n, gpio::MODER::MODER0::RW::Alternate)
     }
 
+    pub const fn memoise_mode_alternate(n: u8) -> MemoisedMode {
+        Self::memoise_mode(n, gpio::MODER::MODER0::RW::Alternate)
+    }
+
     pub fn set_mode_analog(&'a self, n: u8) -> &Self {
         self.set_mode(n, gpio::MODER::MODER0::RW::Analog)
+    }
+
+    pub const fn memoise_mode_analog(n: u8) -> MemoisedMode {
+        Self::memoise_mode(n, gpio::MODER::MODER0::RW::Analog)
     }
 
     pub fn set_otype(&'a self, n: u8, otype: u32) -> &Self {
@@ -197,6 +244,20 @@ impl<'a> Pin<'a> {
         }
     }
 
+    pub fn is_high(&self) -> bool {
+        match self.get_state() {
+            PinState::High => true,
+            PinState::Low => false,
+        }
+    }
+
+    pub fn is_low(&self) -> bool {
+        match self.get_state() {
+            PinState::Low => true,
+            PinState::High => false,
+        }
+    }
+
     pub fn toggle(&'a self) -> &Self {
         self.port.toggle(self.n);
         self
@@ -219,6 +280,27 @@ impl<'a> Pin<'a> {
 
     pub fn set_mode_analog(&'a self) -> &Self {
         self.port.set_mode_analog(self.n);
+        self
+    }
+
+    pub fn memoise_mode_input(&'a self) -> MemoisedMode {
+        GPIO::memoise_mode_input(self.n)
+    }
+
+    pub fn memoise_mode_output(&'a self) -> MemoisedMode {
+        GPIO::memoise_mode_output(self.n)
+    }
+
+    pub fn memoise_mode_alternate(&'a self) -> MemoisedMode {
+        GPIO::memoise_mode_alternate(self.n)
+    }
+
+    pub fn memoise_mode_analog(&'a self) -> MemoisedMode {
+        GPIO::memoise_mode_analog(self.n)
+    }
+
+    pub fn apply_memoised_mode(&'a self, mode: &MemoisedMode) -> &Self {
+        self.port.apply_memoised_mode(mode);
         self
     }
 
@@ -361,7 +443,7 @@ impl<'a> Pins<'a> {
         self.sck.set_mode_alternate();
         self.fpga_so.set_mode_input();
         self.fpga_si.set_mode_input();
-        self.flash_so.set_mode_alternate();
+        self.flash_so.set_otype_pushpull().set_mode_alternate();
         self.flash_si.set_mode_alternate();
     }
 
@@ -373,5 +455,39 @@ impl<'a> Pins<'a> {
         self.flash_si.set_mode_input();
         self.fpga_so.set_mode_input();
         self.fpga_si.set_mode_input();
+    }
+
+    /// Place SPI pins into SWD mode:
+    /// * sck pin is SPI clock
+    /// * fpga_so pin is always MISO
+    /// * flash_si pin is MOSI when we drive SWDIO or input when target drives it
+    /// * flash_so is output open-drain for nRESET
+    pub fn swd_mode(&self) {
+        self.cs.set_mode_input();
+        self.sck.set_mode_alternate().set_pull_up();
+        self.flash_so.set_otype_opendrain().set_high().set_mode_output();
+        self.flash_si.set_mode_alternate();
+        self.fpga_so.set_mode_alternate();
+        self.fpga_si.set_mode_input();
+    }
+
+    /// Disconnect MOSI from flash_si, target drives the bus
+    pub fn swd_rx(&self) {
+        self.flash_si.apply_memoised_mode(&self.flash_si_input_mode);
+    }
+
+    /// Connect MOSI to flash_si, we drive the bus
+    pub fn swd_tx(&self) {
+        self.flash_si.apply_memoised_mode(&self.flash_si_alternate_mode);
+    }
+
+    /// Swap clk pin to direct output mode for manual driving
+    pub fn swd_clk_direct(&self) {
+        self.sck.apply_memoised_mode(&self.sck_output_mode);
+    }
+
+    /// Swap clk pin back to alternate mode for SPI use
+    pub fn swd_clk_spi(&self) {
+        self.sck.apply_memoised_mode(&self.sck_alternate_mode);
     }
 }

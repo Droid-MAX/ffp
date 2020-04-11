@@ -1,4 +1,4 @@
-// Copyright 2019 Adam Greig
+// Copyright 2019-2020 Adam Greig
 // Dual licensed under the Apache 2.0 and MIT licenses.
 
 #[allow(non_snake_case)]
@@ -30,6 +30,10 @@ pub static mut EP0BUF: EPBuf = EPBuf::new();
 #[link_section=".usbram"]
 pub static mut EP1BUF: EPBuf = EPBuf::new();
 
+/// Global buffer for EP2, stored in USB SRAM
+#[link_section=".usbram"]
+pub static mut EP2BUF: EPBuf = EPBuf::new();
+
 /// Global buffer table descriptors, stored in USB SRAM
 #[link_section=".usbram"]
 pub static mut BTABLE: [BTableRow; 8] = [BTableRow::new(); 8];
@@ -44,26 +48,24 @@ impl EPBuf {
 
     /// Copy `data` into the tx buffer
     pub fn write_tx(&mut self, data: &[u8]) {
-        // We have to cast the data to a u16 and write that into the u16 buffer,
+        let n = data.len();
+        assert!(n <= self.tx.len() * 2);
+
+        // We have to convert the incoming bytes to u16 words and write those,
         // as the USB SRAM memory region does not support u8 or u32 writes.
         // The reference manual says it supports u8 writes, but reality disagrees.
-        // UNSAFE: We truncate the length to the smallest number of u16s which
-        // entirely fits within the original u8 slice, so we won't read out of bounds.
-        let data_u16 = unsafe {
-            core::slice::from_raw_parts(&data[0] as *const _ as *const u16, data.len() / 2)
-        };
-        // We cannot use copy_from_slice() as it is promoted to a memcpy which won't
-        // obey the u16 write semantics. Instead we use a manual volatile copy loop.
-        assert!(data_u16.len() <= self.tx.len());
-        for idx in 0..data_u16.len() {
-            // UNSAFE: We already have &mut self and we only write to within
-            // bounds on self.tx. The volatile ensures the write loop is not
-            // optimised to use different access semantics.
-            unsafe { core::ptr::write_volatile(&mut self.tx[idx], data_u16[idx]) };
+        // The input data might not be u16 aligned, so we can't simply cast it either.
+        for (idx, chunk) in data.chunks_exact(2).enumerate() {
+            let w = (chunk[0] as u16) | ((chunk[1] as u16) << 8);
+
+            // A regular write can get optimised into a memcpy which wouldn't obey
+            // the u16 write semantics, so use a manual volatile copy loop.
+            unsafe { core::ptr::write_volatile(&mut self.tx[idx], w) };
         }
+
         // Handle final byte of odd-sized transfers
-        if data.len() & 1 == 1 {
-            self.tx[data_u16.len()] = data[data.len() - 1] as u16;
+        if n & 1 == 1 {
+            self.tx[n/2] = data[data.len() - 1] as u16;
         }
     }
 
