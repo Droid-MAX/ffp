@@ -19,16 +19,24 @@ pub(super) struct ControlEndpoint {
     epbuf: &'static mut EPBuf,
     btable: &'static mut BTableRow,
     pending_request: Option<USBStackRequest>,
+    pending_tx: Option<(usize, usize)>,
+    pending_tx_buf: [u8; 256],
 }
 
 impl ControlEndpoint {
 
     /// Handle transmission completion.
     ///
-    /// This is typically called after we transmit an ACK for an incoming request,
-    /// at which time a pending request is ready to be processed.
-    fn process_tx_complete(&mut self) -> Option<USBStackRequest> {
-        // For most requests, especially including SET_ADDRESS, SET_CONFIGURATION,
+    /// Either we still have more data to transmit, in which case we prepare
+    /// remaining data for transmission, or we have finished transmitting
+    /// an acknowledgement and can now process an incoming request.
+    fn process_tx_complete(&mut self, usb: &usb::Instance) -> Option<USBStackRequest> {
+        // If we have more data to transmit, enqueue it
+        if self.pending_tx.is_some() {
+            self.transmit_next(usb);
+        }
+
+        // For many requests, especially including SET_ADDRESS, SET_CONFIGURATION,
         // or bootload, we have to ensure the response ACK has been transmitted
         // before the request is processed. The ControlEndpoint stores the request
         // and releases it to the stack after the ACK is sent.
@@ -110,6 +118,26 @@ impl ControlEndpoint {
         self.tx_valid(usb);
     }
 
+    fn transmit_next(&mut self, usb: &usb::Instance) {
+        if let Some((idx, len)) = self.pending_tx {
+            if len < 64 {
+                // When there's less than the maximum packet size remaining,
+                // immediately send all remaining data.
+                // This also includes the case where len==0 and we send a ZLP.
+                self.epbuf.write_tx(&self.pending_tx_buf[idx..idx+len]);
+                self.btable.tx_count(len);
+                self.pending_tx = None;
+            } else {
+                // For 64 or more bytes remaining, transmit next packet
+                // and adjust pending_tx.
+                self.epbuf.write_tx(&self.pending_tx_buf[idx..idx+64]);
+                self.btable.tx_count(64);
+                self.pending_tx = Some((idx+64, len-64));
+            }
+            self.tx_valid(usb);
+        }
+    }
+
     /// Indicate a packet has been loaded into the buffer and is ready for transmission
     fn tx_valid(&mut self, usb: &usb::Instance) {
         let (stat_tx, ep_type, ea) = read_reg!(usb, usb, EP0R, STAT_TX, EP_TYPE, EA);
@@ -159,11 +187,8 @@ impl ControlEndpoint {
     /// Transmit CONFIGURATION, INTERFACE, and all ENDPOINT descriptors
     fn process_get_configuration_descriptor(&mut self, usb: &usb::Instance, w_length: u16) {
         // We need to first copy all the descriptors into a single buffer,
-        // as they are not u16-aligned. Helpfully our descriptors add up
-        // to exactly 64 bytes, the maximum we can send in one transfer.
-        // Previously this code implemented multiple transfers for larger
-        // descriptors but it's no longer required.
-        let mut buf = [0u8; 64];
+        // as they are not u16-aligned.
+        let mut buf = [0u8; 128];
         let mut n = 0;
 
         // Copy CONFIGURATION_DESCRIPTOR into buf
@@ -186,20 +211,34 @@ impl ControlEndpoint {
             n += len;
         }
 
-        // Copy DAP_INTERFACE_DESCRIPTOR into buf
-        let len = DAP_INTERFACE_DESCRIPTOR.bLength as usize;
-        let data = DAP_INTERFACE_DESCRIPTOR.to_bytes();
+        // Copy DAP1_INTERFACE_DESCRIPTOR into buf
+        let len = DAP1_INTERFACE_DESCRIPTOR.bLength as usize;
+        let data = DAP1_INTERFACE_DESCRIPTOR.to_bytes();
         buf[n..n+len].copy_from_slice(data);
         n += len;
 
-        // Copy DAP_HID_DESCRIPTOR into buf
-        let len = DAP_HID_DESCRIPTOR.bLength as usize;
-        let data = DAP_HID_DESCRIPTOR.to_bytes();
+        // Copy DAP1_HID_DESCRIPTOR into buf
+        let len = DAP1_HID_DESCRIPTOR.bLength as usize;
+        let data = DAP1_HID_DESCRIPTOR.to_bytes();
         buf[n..n+len].copy_from_slice(data);
         n += len;
 
-        // Copy all DAP_ENDPOINT_DESCRIPTORS into buf
-        for ep in DAP_ENDPOINT_DESCRIPTORS.iter() {
+        // Copy all DAP1_ENDPOINT_DESCRIPTORS into buf
+        for ep in DAP1_ENDPOINT_DESCRIPTORS.iter() {
+            let len = ep.bLength as usize;
+            let data = ep.to_bytes();
+            buf[n..n+len].copy_from_slice(data);
+            n += len;
+        }
+
+        // Copy DAP2_INTERFACE_DESCRIPTOR into buf
+        let len = DAP2_INTERFACE_DESCRIPTOR.bLength as usize;
+        let data = DAP2_INTERFACE_DESCRIPTOR.to_bytes();
+        buf[n..n+len].copy_from_slice(data);
+        n += len;
+
+        // Copy all DAP2_ENDPOINT_DESCRIPTORS into buf
+        for ep in DAP2_ENDPOINT_DESCRIPTORS.iter() {
             let len = ep.bLength as usize;
             let data = ep.to_bytes();
             buf[n..n+len].copy_from_slice(data);
@@ -236,15 +275,17 @@ impl ControlEndpoint {
                 desc
             },
 
-            // Handle manufacturer, product, serial number, and interface strings
-            1..=5 => {
+            // Handle manufacturer, product, serial number, interface, and MOS string
+            1..=6 | 0xEE => {
                 let id;
                 let string = match idx {
                     1 => Ok(STRING_MFN),
                     2 => Ok(STRING_PRD),
                     3 => { id = get_hex_id(); core::str::from_utf8(&id) },
                     4 => Ok(STRING_IF_SPI),
-                    5 => Ok(STRING_IF_DAP),
+                    5 => Ok(STRING_IF_DAP1),
+                    6 => Ok(STRING_IF_DAP2),
+                    0xEE => Ok(STRING_MOS),
                     _ => unreachable!(),
                 };
                 let string = match string {
@@ -259,7 +300,7 @@ impl ControlEndpoint {
                     bDescriptorType: DescriptorType::String as u8,
                     bString: [0u8; 62],
                 };
-                // Encode the &str to an iter of u16 and pack them
+                // Encode the &str to an iter of UTF-16 and pack them
                 for (idx, cp) in string.encode_utf16().enumerate() {
                     let [u1, u2] = cp.to_le_bytes();
                     desc.bString[idx*2  ] = u1;
@@ -283,7 +324,7 @@ impl ControlEndpoint {
     /// Transmit a HID REPORT descriptor
     fn process_get_hid_report_descriptor(&mut self, usb: &usb::Instance, w_length: u16, idx: u8) {
         let report = match idx {
-            0 => &DAP_HID_REPORT[..],
+            0 => &DAP1_HID_REPORT[..],
             _ => {
                 self.stall(usb);
                 return;
@@ -384,6 +425,40 @@ impl ControlEndpoint {
                 None
             },
 
+            Ok(VendorRequest::GetOSFeature) => {
+                match OSFeatureDescriptorType::try_from(setup.wIndex) {
+                    Ok(OSFeatureDescriptorType::CompatibleID) => {
+                        // Handle request for an Extended Compatible ID Descriptor.
+                        // Interface number is ignored as there is only one device-wide
+                        // Compatible ID Descriptor.
+                        let descriptor = &MS_COMPATIBLE_ID_DESCRIPTOR;
+                        let n = u32::min(descriptor.dwLength, setup.wLength as u32) as usize;
+                        let data = descriptor.to_bytes();
+                        self.transmit_slice(usb, &data[..n]);
+                    },
+                    Ok(OSFeatureDescriptorType::Properties) => {
+                        // Handle request for an Extended Properties OS Descriptor.
+                        let iface = setup.wValue as u8;
+                        match iface {
+                            2 => {
+                                let descriptor = &IF2_MS_PROPERTIES_OS_DESCRIPTOR;
+                                let n = usize::min(descriptor.len(), setup.wLength as usize);
+                                let mut buf = [0u8; 192];
+                                descriptor.write_to_buf(&mut buf[..]);
+                                self.transmit_slice(usb, &buf[..n]);
+                            },
+                            _ => {
+                                self.stall(usb);
+                            },
+                        }
+                    },
+                    _ => {
+                        self.stall(usb);
+                    },
+                }
+                None
+            },
+
             // Ignore unknown requests
             _ => {
                 self.stall(usb);
@@ -399,6 +474,8 @@ impl Endpoint for ControlEndpoint {
             epbuf,
             btable,
             pending_request: None,
+            pending_tx: None,
+            pending_tx_buf: [0u8; 256],
         }
     }
 
@@ -430,7 +507,7 @@ impl Endpoint for ControlEndpoint {
         let (ctr_tx, ctr_rx, ep_type, ea) =
             read_reg!(usb, usb, EP0R, CTR_TX, CTR_RX, EP_TYPE, EA);
         if ctr_tx == 1 {
-            req = self.process_tx_complete();
+            req = self.process_tx_complete(usb);
 
             // Clear CTR_TX
             write_reg!(usb, usb, EP0R, CTR_RX: 1, EP_TYPE: ep_type, CTR_TX: 0, EA: ea);
@@ -446,9 +523,22 @@ impl Endpoint for ControlEndpoint {
 
     /// Enqueue a slice of up to 64 bytes of data for transmission.
     fn transmit_slice(&mut self, usb: &usb::Instance, data: &[u8]) {
-        assert!(data.len() <= 64);
-        self.epbuf.write_tx(data);
-        self.btable.tx_count(data.len());
+        assert!(data.len() <= 320);
+        if data.len() < 64 {
+            // For packets less than the maximum packet size, we can immediately
+            // send the entire packet.
+            self.epbuf.write_tx(data);
+            self.btable.tx_count(data.len());
+        } else {
+            // For packets equal to the maximum packet size, we need to send
+            // a zero-length-packet afterwards. For packets greater, we store
+            // the remaining data for later transmission.
+            self.epbuf.write_tx(&data[..64]);
+            self.btable.tx_count(64);
+            let leftover = data.len() - 64;
+            self.pending_tx_buf[..leftover].copy_from_slice(&data[64..]);
+            self.pending_tx = Some((0, data.len() - 64));
+        }
         self.tx_valid(usb);
     }
 
